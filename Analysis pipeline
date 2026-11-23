@@ -1,0 +1,1396 @@
+# MORETON BAY CORAL — FULL ANALYSIS PIPELINE
+# "Site-specific coral community trajectories along a high-latitude estuarine gradient"
+#
+# This script runs top-to-bottom and reproduces every analysis and figure
+# in the manuscript. It is organized into the following sections:
+#
+#   0. Setup            — packages and user-editable file paths
+#   1. Site metadata     — coordinates, distance from Brisbane River mouth
+#   2. Data import        — raw CSV, benthic category construction
+#   3. FIGURE 2  — cross-shelf community structure (PCoA + PAM clustering
+#                  + site map + trajectory panel)
+#   4. FIGURE 3  — five-metric site x time grid (composition, cover,
+#                  turnover, dispersion, similarity to baseline)
+#   5. Statistics — distance-based PERMANOVA with site x time random slopes
+#   6. FIGURE 4  — regional thermal stress (Degree Heating Week) history
+#   7. Supplementary analyses — whole-record mean composition by site,
+#                  pairwise SIMPER
+#.  8. Figure 1 - site map
+#
+# Each figure section ends with an explicit ggsave() call
+
+# DATA DEPENDENCIES (not included in this script):
+#   - MB_coral_regrouped.csv        : raw photoquadrat point-count data
+#   - CRW/DHW/*.tif                 : daily NOAA Coral Reef Watch DHW rasters
+#   - CRW/DHW/dhw_annual_max.tif    : cached per-pixel annual DHW maximum
+#                                      (see Section 6 for how this is built)
+#   - rnaturalearthhires             : install separately, see Section 6
+#   - distmer                        : install separately, see Section 5
+#
+# Edit the paths in Section 0b to match your local setup before running.
+
+## 0a. SETUP
+
+# Two packages are not on CRAN and must be installed separately before
+# running this script for the first time:
+#   remotes::install_github("marine-ecologist/distmer")            # Section 5
+#   install.packages("rnaturalearthhires",
+#                     repos = "https://ropensci.r-universe.dev")   # Section 6
+
+required_packages <- c(
+  "tidyverse",    
+  "vegan",        
+  "cluster",      
+  "ggrepel",     
+  "ggtext",       
+  "sf",           
+  "terra",        
+  "scales",       
+  "patchwork",    
+  "tidyterra",   
+  "rnaturalearth",     
+  "rnaturalearthhires",
+  "distmer"       
+)
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+## 0b
+# EDIT THESE FOUR LINES to match your local file locations, then the rest of
+
+project_dir  <- "/Users/nick/Desktop/Moreton_Bay_project/"
+raw_csv_path <- file.path(project_dir, "MB_coral_regrouped.csv")
+dhw_tif_dir  <- file.path(project_dir, "CRW/DHW")                     # folder of daily DHW GeoTIFFs
+dhw_annual_max_path <- file.path(dhw_tif_dir, "dhw_annual_max.tif")   # cached annual composite, see Section 6
+
+output_dir <- file.path(project_dir, "outputs")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+setwd(project_dir)
+
+## 1. SITE METADATA: coordinates and distance from Brisbane River mouth
+
+sites_coords <- tribble(
+  ~site,              ~transect, ~lon,       ~lat,
+  "Goat Island",      "T1",      153.38666, -27.51592,
+  "Green Island",     "T1",      153.24628, -27.42648,
+  "Myora Reef",       "T1",      153.40898, -27.47254,
+  "Wellington Point", "T1",      153.24707, -27.45656,
+  "Peel Island",      "T1",      153.37662, -27.49697,
+  "Flinders Reef",    "T1",      153.48420, -26.97780,
+  "Flinders Reef",    "T2",      153.48430, -26.97740,
+  "Flinders Reef",    "T3",      153.48440, -26.97720,
+  "Flat Rock",        "T1",      153.55100, -27.39130,
+  "Flat Rock",        "T2",      153.55100, -27.39140,
+  "Flat Rock",        "T3",      153.55100, -27.39170,
+  "Shag Rock",        "T1",      153.52660, -27.41420,
+  "Shag Rock",        "T2",      153.52640, -27.41440
+) |>
+  # Only the first transect's coordinates are needed for site-level maps
+  # and distance calculations; T2/T3 rows exist only because the original
+  # coordinate table was shared across per-transect and per-site uses.
+  filter(transect == "T1") |>
+  select(-transect)
+
+sites_sf <- st_as_sf(
+  sites_coords,
+  coords = c("lon", "lat"),
+  crs = 4326,
+  remove = FALSE
+)
+
+# Reference point: mouth of the Brisbane River, used as the origin for the
+# cross-shelf distance gradient throughout the manuscript.
+brisbane <- st_sfc(st_point(c(153.16096, -27.37161)), crs = 4326)
+
+# Straight-line distance (km) from each site to the Brisbane River mouth.
+dist_lut <- sites_sf |>
+  mutate(dist_km = as.numeric(st_distance(geometry, brisbane)) / 1000) |>
+  st_drop_geometry() |>
+  select(site, dist_km)
+
+# "fl" = site label with distance appended, e.g. "Green Island  (10.4 km)".
+# fl_order fixes the factor level order (nearest to farthest from the river)
+# used for every faceted figure in the manuscript.
+fl_order <- dist_lut |>
+  arrange(dist_km) |>
+  mutate(fl = paste0(site, "  (", round(dist_km, 1), " km)")) |>
+  pull(fl)
+
+
+## 2. DATA IMPORT & BENTHIC CATEGORY CONSTRUCTION
+
+## 2a. PCoA/clustering helper function
+# Builds a Bray-Curtis-based PCoA ordination from a community matrix, adds a
+# constant "dummy" column (see Methods) to stabilize distances for low-cover
+# surveys, computes site-level dispersion (betadisper) and taxon
+# weighted-average vectors for plotting. Used to build Figure 1's ordination.
+
+make_survey_pcoa <- function(input_df, cols, group_name = "community", dummy = TRUE) {
+  
+  survey_df <- input_df |>
+    arrange(site, survey_date) |>
+    mutate(survey_id = paste(site, year, sprintf("%02d", month), sep = "_"))
+  
+  survey_comm_raw <- survey_df |>
+    select(all_of(cols)) |>
+    as.matrix()
+  
+  survey_comm_raw[is.na(survey_comm_raw)] <- 0
+  rownames(survey_comm_raw) <- survey_df$survey_id
+  
+  survey_comm <- survey_comm_raw
+  
+  # Constant dummy variable (value = 1 for every survey), appended before
+  # calculating Bray-Curtis dissimilarities, to stabilize distance estimates
+  # for surveys with low or zero cover across multiple categories.
+  if (isTRUE(dummy)) {
+    survey_comm <- survey_comm |>
+      as.data.frame() |>
+      mutate(dummy = 1) |>
+      as.matrix()
+  }
+  
+  survey_bray <- vegan::vegdist(survey_comm, method = "bray")
+  
+  survey_pcoa <- cmdscale(survey_bray, k = 2, eig = TRUE, add = TRUE)
+  
+  eig_pos <- survey_pcoa$eig[survey_pcoa$eig > 0]
+  pct_exp <- round(eig_pos[1:2] / sum(eig_pos) * 100, 1)
+  
+  survey_scores <- as.data.frame(survey_pcoa$points) |>
+    setNames(c("PCoA1", "PCoA2")) |>
+    bind_cols(
+      survey_df |>
+        select(site, year, month, year_month, survey_date, month_category,
+               dist_km, fl, survey_id)
+    )
+  
+  # Within-site dispersion: each survey's distance from its site's OVERALL
+  # centroid (across all years), rescaled 0-1.
+  survey_betadisper_site <- vegan::betadisper(
+    d = survey_bray,
+    group = survey_df$site,
+    type = "centroid"
+  )
+  
+  survey_scores <- survey_scores |>
+    mutate(
+      distance_from_site_centroid_full = survey_betadisper_site$distances,
+      stability_from_site_centroid_full =
+        1 - distance_from_site_centroid_full /
+        max(distance_from_site_centroid_full, na.rm = TRUE)
+    )
+  
+  # Species weighted-average scores, computed on the RAW (non-dummy-augmented)
+  # matrix, used to plot taxon vectors on the ordination.
+  wa_scores <- vegan::wascores(survey_pcoa$points, survey_comm_raw)
+  
+  taxa_df <- as.data.frame(wa_scores) |>
+    setNames(c("PCoA1", "PCoA2")) |>
+    rownames_to_column("taxon") |>
+    mutate(taxon = taxon |> str_replace_all("_", " ") |> str_replace_all("\\.", " "))
+  
+  # Scale taxon vectors to ~60% of the ordination's spatial extent so they
+  # are visible alongside the site points without dominating the plot.
+  vec_scale <- 0.6 *
+    max(abs(range(survey_scores$PCoA1)), abs(range(survey_scores$PCoA2))) /
+    max(sqrt(taxa_df$PCoA1^2 + taxa_df$PCoA2^2))
+  
+  taxa_scaled <- taxa_df |>
+    mutate(PCoA1s = PCoA1 * vec_scale, PCoA2s = PCoA2 * vec_scale)
+  
+  list(
+    name = group_name,
+    survey_df = survey_df,
+    comm_raw = survey_comm_raw,
+    comm = survey_comm,
+    bray = survey_bray,
+    pcoa = survey_pcoa,
+    pct_exp = pct_exp,
+    scores = survey_scores,
+    taxa = taxa_df,
+    taxa_scaled = taxa_scaled,
+    betadisper_site = survey_betadisper_site
+  )
+}
+
+## 2b. Import raw survey data
+raw <- read.csv(raw_csv_path, check.names = FALSE) |>
+  rename("date_utc" = 1)
+
+# Full 15-category benthic matrix (living groups + non-living substratum),
+# used for the whole-benthos PERMANOVA in Section 5.
+comm_cols <- c(
+  "Pocillopora_Stylophora", "Corallimorpharia", "Acropora_Arborescent",
+  "Acropora_Tabulate", "Encrusting_corals", "Plate_corals",
+  "Macroalgae.Cyanobacteria", "Porifera", "Sand", "Muddy.Sand",
+  "Reef_framework", "Exposed_rock", "Soft_Coral",
+  "Digitate_corymbose_corals", "Massive"
+)
+
+# Biotic-only subset (living groups), used throughout Figures 1 and 2.
+biotic_cols <- c(
+  "Pocillopora_Stylophora", "Corallimorpharia", "Acropora_Arborescent",
+  "Acropora_Tabulate", "Encrusting_corals", "Plate_corals",
+  "Macroalgae.Cyanobacteria", "Porifera", "Soft_Coral",
+  "Digitate_corymbose_corals", "Massive"
+)
+
+# Non-living substratum categories (used only in comm_cols above).
+abiotic_cols <- c("Sand", "Muddy.Sand", "Reef_framework", "Exposed_rock")
+
+# Living coral growth-form categories only (excludes
+# Corallimorpharia, macroalgae/cyanobacteria, Porifera), used for total
+# coral cover in Figure 2.
+coral_cols <- c(
+  "Pocillopora_Stylophora", "Acropora_Arborescent", "Acropora_Tabulate",
+  "Encrusting_corals", "Plate_corals", "Digitate_corymbose_corals",
+  "Massive", "Soft_Coral"
+)
+
+# Site groupings used to route the ambiguous "CCA_EAM" substratum columns
+# to the correct category below (inner-bay sites record it as reef
+# framework/rubble; outer sites record it as exposed rock).
+inner_bay_sites <- c("Goat Island", "Green Island", "Myora Reef",
+                     "Peel Island", "Wellington Point")
+outer_sites <- c("Flat Rock", "Flinders Reef", "Shag Rock")
+
+## 2c. Recode raw columns into analysis categories
+# Averages across transects to one row per site x survey month, and joins
+# on distance-from-river. Two exclusions applied here are analysis
+# decisions, not data errors — see comments below.
+
+df_analysis <- raw |>
+  mutate(
+    year = as.integer(year),
+    month = as.integer(month),
+    
+    # Merge bleached and non-bleached point-count columns into single taxa,
+    # since bleaching status is tracked separately from the compositional
+    # analysis in this manuscript.
+    Corallimorpharia = `Bleached.Corallimorpharia` + Corallimorpharia,
+    Pocillopora_Stylophora = Bleached_Pocillopora + Pocillopora_Stylophora,
+    
+    Massive = Small_Massive_encrusting_corals +
+      Medium_Massive_encrusting_corals +
+      Large_Massive_encrusting_corals,
+    
+    Sand = Sand + `BMA.on.sand`,
+    
+    # CCA_EAM columns are routed to Reef_framework at inner-bay sites and
+    # Exposed_rock at outer sites (these substratum types are mutually
+    # exclusive by site in the original survey design).
+    Reef_framework = case_when(
+      site %in% inner_bay_sites ~ CCA_EAM_Rubble + CCA_EAM_Hard_Substrate,
+      TRUE ~ 0
+    ),
+    Exposed_rock = case_when(
+      site %in% outer_sites ~ CCA_EAM_Rubble + CCA_EAM_Hard_Substrate,
+      TRUE ~ 0
+    ),
+    
+    survey_date = as.Date(paste(year, month, "01", sep = "-")),
+    site_trans = paste(site, transect, sep = "_T")
+  ) |>
+  select(date_utc, survey_date, year, month, month_category, site, transect,
+         site_trans, all_of(comm_cols)) |>
+
+  group_by(site, survey_date, year, month, month_category) |>
+  summarise(
+    across(all_of(comm_cols), \(x) mean(x, na.rm = TRUE)),
+    n_transects = n_distinct(site_trans),
+    .groups = "drop"
+  ) |>
+  left_join(dist_lut, by = "site") |>
+  mutate(
+    survey_id = paste(site, year, sprintf("%02d", month), sep = "_"),
+    year_month = paste(year, sprintf("%02d", month), sep = "-"),
+    fl = paste0(site, "  (", round(dist_km, 1), " km)"),
+    fl = factor(fl, levels = fl_order)
+  ) |>
+  
+  filter(year != 2020) |>
+  
+  filter(!(site == "Peel Island" & year == 2025)) |>
+  droplevels()
+
+## 2d. Biotic-only long-format data (for composition plots)
+
+biotic_label_recode <- c(
+  "Digitate corymbose corals" = "*Acropora* corymbose / digitate corals",
+  "Pocillopora Stylophora"   = "Branching corymbose corals",
+  "Massive"                  = "Massive corals",
+  "Soft Coral"               = "Soft corals",
+  "Acropora Arborescent"     = "*Acropora* arborescent corals",
+  "Acropora Tabulate"        = "*Acropora* tabulate corals",
+  "Macroalgae Cyanobacteria" = "Macroalgae / Cyanobacteria"
+)
+
+recode_biotic_label <- function(x) {
+  ifelse(x %in% names(biotic_label_recode), unname(biotic_label_recode[x]), x)
+}
+
+biotic_palette <- c(
+  # hard corals: warm coral/pink/purple palette
+  "Plate corals" = "#fb8072",
+  "Pocillopora Stylophora" = "#fdb462",
+  "Digitate corymbose corals" = "#fdae61",
+  "Massive" = "#d95f02",
+  "Acropora Tabulate" = "#c77cff",
+  "Acropora Arborescent" = "#e78ac3",
+  # other sessile benthos: blue/teal palette
+  "Soft Coral" = "#1f9fb5",
+  "Porifera" = "#4dbbd5",
+  "Corallimorpharia" = "#00a6a6",
+  "Encrusting corals" = "#66c2a5",
+  # macroalgae/cyanobacteria: green
+  "Macroalgae Cyanobacteria" = "#2ca25f",
+  # substratum (not used in biotic-only plots, kept for palette completeness)
+  "Sand" = "#d8c99b",
+  "Muddy Sand" = "#a67c52",
+  "Reef framework" = "#8c8c8c",
+  "Exposed rock" = "#4d4d4d"
+)
+
+# Palette names are recoded to the new display labels here, so scale_fill_
+# manual(values = biotic_palette) downstream automatically uses the
+# updated labels without any further changes at the point of use.
+names(biotic_palette) <- recode_biotic_label(names(biotic_palette))
+
+df_biotic_long <- df_analysis |>
+  droplevels() |>
+  mutate(survey_date = as.Date(survey_date), site = factor(site)) |>
+  pivot_longer(cols = all_of(biotic_cols), names_to = "biotic_group", values_to = "cover") |>
+  mutate(
+    cover = replace_na(cover, 0),
+    biotic_group = str_replace_all(biotic_group, "_", " "),
+    biotic_group = str_replace_all(biotic_group, "\\.", " "),
+    biotic_group = recode_biotic_label(biotic_group),
+    biotic_group = droplevels(factor(biotic_group, levels = names(biotic_palette))),
+    facet_label = paste0(site, "  (", round(dist_km, 1), " km)"),
+    facet_label = factor(facet_label, levels = c(
+      "Green Island  (10.4 km)", "Wellington Point  (12.7 km)",
+      "Peel Island  (25.4 km)", "Myora Reef  (26.9 km)",
+      "Goat Island  (27.5 km)", "Shag Rock  (36.4 km)",
+      "Flat Rock  (38.6 km)", "Flinders Reef  (54.2 km)"
+    ))
+  )
+
+## 2e. Biotic community matrix for ordination/clustering
+
+absolute_cover <- FALSE
+
+biotic_df <- df_analysis |>
+  mutate(biotic_total = rowSums(across(all_of(biotic_cols)), na.rm = TRUE))
+
+if (isTRUE(absolute_cover)) {
+  biotic_df <- biotic_df |>
+    mutate(across(all_of(biotic_cols),
+                  \(x) ifelse(biotic_total > 0, x / biotic_total * 100, NA_real_)))
+}
+
+
+## 3. FIGURE 1 — Cross-shelf community structure and site trajectories
+# Reproduces:PCoA ordination with PAM-clustered
+# community types (panel A), and site trajectories through time (panel B).
+
+## 3a. Ordination and clustering
+
+pcoa_biotic <- make_survey_pcoa(
+  input_df = biotic_df,
+  cols = biotic_cols,
+  group_name = "Biotic community"
+)
+
+survey_biotic_comm <- pcoa_biotic$comm
+survey_biotic_bray <- pcoa_biotic$bray
+
+# Select the number of PAM clusters (k = 2-8) by maximizing average
+# silhouette width.
+sil_biotic_df <- tibble(k = 2:min(8, nrow(survey_biotic_comm) - 1)) |>
+  mutate(
+    pam_fit = map(k, \(x) cluster::pam(survey_biotic_bray, k = x, diss = TRUE)),
+    avg_sil_width = map_dbl(pam_fit, \(x) x$silinfo$avg.width)
+  )
+
+best_biotic_k <- sil_biotic_df |>
+  slice_max(avg_sil_width, n = 1, with_ties = FALSE) |>
+  pull(k)
+
+pam_biotic_fit <- cluster::pam(survey_biotic_bray, k = best_biotic_k, diss = TRUE)
+
+survey_biotic_clusters <- pcoa_biotic$scores |>
+  mutate(
+    community_type_biotic = factor(pam_biotic_fit$clustering),
+    community_type_biotic = fct_reorder(community_type_biotic, as.numeric(community_type_biotic))
+  )
+
+# Top 10 taxa by combined |PCoA1| + |PCoA2| loading, for the vector overlay.
+pcoa_bioticvectors <- pcoa_biotic$taxa_scaled |>
+  arrange(desc(abs(PCoA1) + abs(PCoA2))) |>
+  slice_head(n = 10)
+
+
+taxon_plotmath_recode <- c(
+  "Digitate corymbose corals" = "italic('Acropora')~corymbose~'/'~digitate~corals",
+  "Pocillopora Stylophora"   = "'Branching corymbose corals'",
+  "Massive"                  = "'Massive corals'",
+  "Soft Coral"               = "'Soft corals'",
+  "Acropora Arborescent"     = "italic('Acropora')~arborescent~corals",
+  "Acropora Tabulate"        = "italic('Acropora')~tabulate~corals",
+  "Macroalgae Cyanobacteria" = "'Macroalgae / Cyanobacteria'"
+)
+
+pcoa_bioticvectors <- pcoa_bioticvectors |>
+  mutate(
+    taxon_expr = if_else(
+      taxon %in% names(taxon_plotmath_recode),
+      unname(taxon_plotmath_recode[taxon]),
+      paste0("'", taxon, "'")
+    )
+  )
+
+## 3b. Shared plotting setup
+
+community_pal <- c("#0072B2", "#E69F00", "#009E73", "#CC79A7", "#56B4E9", "#000000")
+
+GOAT <- "Goat Island"   # site highlighted with a red trajectory in panel B
+PEEL <- "Peel Island"   # site highlighted with a blue trajectory in panel B
+
+xlab <- paste0("PCoA 1 (", pcoa_biotic$pct_exp[1], "%)")
+ylab <- paste0("PCoA 2 (", pcoa_biotic$pct_exp[2], "%)")
+
+# Common axis limits so panels A and B share the same ordination frame.
+pad <- 0.06
+xr <- range(survey_biotic_clusters$PCoA1, na.rm = TRUE) + c(-pad, pad)
+yr <- range(survey_biotic_clusters$PCoA2, na.rm = TRUE) + c(-pad, pad)
+
+
+base_theme <- theme_bw(base_size = 15) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(face = "plain", size = 15, hjust = 0),
+    plot.subtitle    = element_text(colour = "grey35", size = 11),
+    legend.position  = "bottom",
+    legend.text      = element_text(size = 12),
+    legend.title     = element_text(size = 13),
+    axis.title       = element_text(size = 14),
+    axis.text        = element_text(size = 11)
+  )
+
+
+survey_traj <- survey_biotic_clusters |>
+  arrange(site, year_month) |>
+  mutate(
+    is_goat = site == GOAT,
+    is_peel = site == PEEL,
+    trajectory_group = case_when(
+      is_goat ~ "Goat Island",
+      is_peel ~ "Peel Island",
+      TRUE ~ "Other sites"
+    )
+  )
+
+goat_traj  <- survey_traj |> filter(is_goat)
+peel_traj  <- survey_traj |> filter(is_peel)
+
+trajectory_colours <- c(
+  "Other sites" = "grey70",
+  "Goat Island" = "darkred",
+  "Peel Island" = "darkblue"
+)
+
+## 3c. Panel A: community types + defining taxa
+
+community_hulls <- survey_biotic_clusters |>
+  filter(!is.na(PCoA1), !is.na(PCoA2), !is.na(community_type_biotic)) |>
+  group_by(community_type_biotic) |>
+  slice(chull(PCoA1, PCoA2)) |>
+  ungroup()
+
+pA <- ggplot(survey_biotic_clusters, aes(PCoA1, PCoA2)) +
+  geom_polygon(
+    data = community_hulls,
+    aes(group = community_type_biotic, fill = community_type_biotic),
+    colour = NA, alpha = 0.18
+  ) +
+  geom_segment(
+    data = pcoa_bioticvectors,
+    aes(x = 0, y = 0, xend = PCoA1s, yend = PCoA2s),
+    arrow = arrow(length = unit(0.18, "cm"), type = "closed"),
+    colour = "grey55", linewidth = 0.5, inherit.aes = FALSE
+  ) +
+  geom_point(aes(fill = community_type_biotic), shape = 21, size = 2,
+             colour = "black", stroke = 0.3) +
+
+  geom_text_repel(
+    data = pcoa_bioticvectors,
+    aes(x = PCoA1s * 1.12, y = PCoA2s * 1.12, label = taxon_expr),
+    size = 3.4, colour = "grey30", parse = TRUE,
+    inherit.aes = FALSE, max.overlaps = Inf, seed = 1
+  ) +
+  scale_fill_manual(values = community_pal) +
+  scale_x_reverse() +
+  coord_equal(xlim = xr, ylim = yr) +
+  labs(x = xlab, y = ylab, fill = "Biotic community type", title = "A) Community types") +
+  base_theme
+
+## 3d. Panel B: site trajectories through time
+
+other_traj <- survey_traj |>
+  filter(!is_goat & !is_peel)
+
+# Start/end marker applied to EVERY site's trajectory (all 8), giving a
+# consistent visual cue for where each trajectory begins and ends.
+all_endpoints <- survey_traj |>
+  group_by(site) |>
+  filter(year_month == min(year_month) | year_month == max(year_month)) |>
+  mutate(stage = if_else(year_month == min(year_month), "Start", "End")) |>
+  ungroup()
+
+
+site_start_points <- all_endpoints |> filter(stage == "Start")
+
+pB <- ggplot(survey_biotic_clusters, aes(PCoA1, PCoA2)) +
+  geom_polygon(
+    data = community_hulls,
+    aes(group = community_type_biotic, fill = community_type_biotic),
+    colour = NA, alpha = 0.18
+  ) +
+  geom_point(aes(fill = community_type_biotic), shape = 21, size = 2,
+             colour = "black", stroke = 0.3) +
+  geom_text_repel(
+    data = site_start_points, aes(label = site), size = 3.6, colour = "grey20",
+    segment.colour = "grey30", segment.size = 0.6, segment.alpha = 0.9,
+    min.segment.length = 0, max.overlaps = Inf, seed = 1
+  ) +
+  geom_path(data = other_traj, aes(group = site, colour = trajectory_group),
+            linewidth = 0.4, alpha = 0.85) +
+  geom_point(data = other_traj, aes(fill = community_type_biotic),
+             shape = 21, show.legend = FALSE, size = 1.01, colour = "grey35", stroke = 0.25) +
+  # Goat Island: dark red arrowed path, diamond markers.
+  geom_path(data = goat_traj, aes(group = site, colour = trajectory_group),
+            linewidth = 0.6, arrow = arrow(length = unit(0.18, "cm"), type = "closed")) +
+  geom_point(data = goat_traj, aes(fill = community_type_biotic), shape = 23,
+             size = 1.8, colour = "black", stroke = 0.7) +
+  # Peel Island: dark blue arrowed path, triangle markers.
+  geom_path(data = peel_traj, aes(group = site, colour = trajectory_group),
+            linewidth = 0.6, arrow = arrow(length = unit(0.18, "cm"), type = "closed")) +
+  geom_point(data = peel_traj, aes(fill = community_type_biotic), shape = 24,
+             size = 1.8, colour = "black", stroke = 0.7) +
+  geom_point(
+    data = all_endpoints, aes(shape = stage),
+    fill = NA, colour = "black", size = 3.4, stroke = 1
+  ) +
+  scale_fill_manual(values = community_pal) +
+  scale_colour_manual(values = trajectory_colours, name = "Trajectory") +
+  scale_shape_manual(values = c(Start = 21, End = 22), name = "Trajectory point") +
+  scale_x_reverse() +
+  coord_equal(xlim = xr, ylim = yr) +
+  labs(x = xlab, y = ylab, fill = "Biotic community type",
+       title = "B) Site trajectories through time") +
+  base_theme +
+  guides(colour = "none", fill = "none")
+
+## 3e. Combine panels and save
+
+figure_1 <- (pA | pB) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+figure_1
+
+ggsave(
+  filename = file.path(output_dir, "Figure1_community_structure_trajectories.png"),
+  plot = figure_1, width = 15, height = 7.5, dpi = 600
+)
+
+
+## 4. FIGURE 2 — Five-metric site x time grid
+# Reproduces the site (columns) x metric (rows) grid: benthic composition,
+# coral cover, cumulative turnover, distance from site centroid, and
+# similarity to baseline.
+
+## 4a. Similarity to baseline
+# Baseline = each site's first available survey (August 2021). Similarity is
+# one minus the Bray-Curtis dissimilarity (with a +1 offset applied to the
+# paired community vectors) between each survey and that baseline.
+
+baseline_biotic_centroids <- pcoa_biotic$scores |>
+  group_by(site) |>
+  filter(survey_date == min(survey_date, na.rm = TRUE)) |>
+  summarise(
+    baseline_year = first(year),
+    baseline_month = first(month),
+    baseline_survey_date = first(survey_date),
+    baseline_PCoA1 = mean(PCoA1, na.rm = TRUE),
+    baseline_PCoA2 = mean(PCoA2, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+stability_biotic_df <- pcoa_biotic$scores |>
+  left_join(baseline_biotic_centroids, by = "site") |>
+  group_by(site) |>
+  mutate(
+    site_centroid_PCoA1 = mean(PCoA1, na.rm = TRUE),
+    site_centroid_PCoA2 = mean(PCoA2, na.rm = TRUE)
+  ) |>
+  ungroup() |>
+  mutate(
+    distance_from_site_centroid = distance_from_site_centroid_full,
+    stability_from_site_centroid = stability_from_site_centroid_full
+  )
+
+baseline_biotic_comm <- biotic_df |>
+  group_by(site) |>
+  filter(survey_date == min(survey_date, na.rm = TRUE)) |>
+  summarise(across(all_of(biotic_cols), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+
+bray_biotic_baseline_df <- biotic_df |>
+  select(site, year, month, year_month, survey_date, month_category, dist_km, fl,
+         all_of(biotic_cols)) |>
+  left_join(
+    baseline_biotic_comm |> rename_with(\(x) paste0("baseline_", x), all_of(biotic_cols)),
+    by = "site"
+  ) |>
+  rowwise() |>
+  mutate(
+    bray_to_baseline = vegan::vegdist(
+      rbind(c_across(all_of(biotic_cols)), c_across(paste0("baseline_", biotic_cols))) + 1,
+      method = "bray"
+    ) |> as.numeric(),
+    similarity_to_baseline = 1 - bray_to_baseline
+  ) |>
+  ungroup() |>
+  select(site, year, month, year_month, survey_date, month_category,
+         bray_to_baseline, similarity_to_baseline)
+
+stability_biotic_df <- stability_biotic_df |>
+  left_join(bray_biotic_baseline_df,
+            by = c("site", "year", "month", "year_month", "survey_date", "month_category"))
+
+## 4b. Cumulative temporal turnover
+
+temporal_turnover_survey <- biotic_df |>
+  arrange(site, survey_date) |>
+  group_by(site) |>
+  group_modify(\(.x, .y) {
+    comm <- .x |>
+      select(all_of(biotic_cols)) |>
+      mutate(across(everything(), ~ replace_na(.x, 0))) |>
+      as.matrix()
+    storage.mode(comm) <- "double"
+    turnover <- c(
+      NA_real_,
+      map_dbl(2:nrow(comm), \(i)
+              vegan::vegdist(
+                rbind(c(comm[i - 1, ], dummy = 1), c(comm[i, ], dummy = 1)),
+                method = "bray"
+              ) |> as.numeric()
+      )
+    )
+    .x |> mutate(temporal_turnover = turnover)
+  }) |>
+  ungroup() |>
+  group_by(site) |>
+  mutate(cumulative_turnover = cumsum(replace_na(temporal_turnover, 0))) |>
+  ungroup()
+
+## 4c. Coral cover (with corrected transect-level SE)
+
+coral_cover_survey <- raw |>
+  mutate(
+    year = as.integer(year),
+    month = as.integer(month),
+    survey_date = as.Date(paste(year, month, "01", sep = "-")),
+    site_trans = paste(site, transect, sep = "_T"),
+    Massive = Small_Massive_encrusting_corals +
+      Medium_Massive_encrusting_corals +
+      Large_Massive_encrusting_corals,
+    Pocillopora_Stylophora = Bleached_Pocillopora + Pocillopora_Stylophora,
+    coral_total = rowSums(across(all_of(coral_cols)), na.rm = TRUE)
+  ) |>
+  filter(year != 2020, !(site == "Peel Island" & year == 2025)) |>
+  group_by(site, survey_date, year, month) |>
+  summarise(
+    mean_coral_cover = mean(coral_total, na.rm = TRUE),
+    se_coral_cover = sd(coral_total, na.rm = TRUE) / sqrt(n_distinct(site_trans)),
+    n_transects = n_distinct(site_trans),
+    .groups = "drop"
+  ) |>
+  left_join(dist_lut, by = "site") |>
+  mutate(
+    year_month = paste(year, sprintf("%02d", month), sep = "-"),
+    fl = paste0(site, "  (", round(dist_km, 1), " km)"),
+    fl = factor(fl, levels = fl_order)
+  )
+
+## 4d. Shared facet structure for the combined figure
+
+metric_levels <- c("Benthic composition", "Coral cover", "Cumulative turnover",
+                   "Distance from site centroid", "Similarity to baseline")
+
+metric_labels <- c(
+  "Benthic composition" = "A) Benthic\ncomposition (%)",
+  "Coral cover" = "B) Coral\ncover (%)",
+  "Cumulative turnover" = "C) Cumulative\nturnover",
+  "Distance from site centroid" = "D) Distance from\nsite centroid",
+  "Similarity to baseline" = "E) Similarity to\nbaseline"
+)
+
+fl_levels <- levels(droplevels(factor(coral_cover_survey$fl)))
+
+
+trunc2 <- function(x) {
+  x |>
+    str_remove("\\s*\\(.*") |>
+    str_squish() |>
+    str_split("\\s+") |>
+    vapply(\(w) paste(head(w, 2), collapse = " "), character(1))
+}
+
+area_plot_data <- df_biotic_long |>
+  transmute(
+    fl = factor(facet_label, levels = fl_levels), survey_date, biotic_group, cover,
+    metric = factor("Benthic composition", levels = metric_levels)
+  ) |>
+  arrange(fl, survey_date, biotic_group)
+
+coral_ribbon_data <- coral_cover_survey |>
+  transmute(
+    fl = factor(fl, levels = fl_levels), site, survey_date,
+    value = mean_coral_cover,
+    ymin = pmax(0, mean_coral_cover - se_coral_cover),
+    ymax = mean_coral_cover + se_coral_cover,
+    metric = factor("Coral cover", levels = metric_levels)
+  ) |>
+  arrange(fl, site, survey_date)
+
+line_plot_data <- bind_rows(
+  coral_ribbon_data |> select(fl, site, survey_date, metric, value),
+  temporal_turnover_survey |>
+    transmute(fl = factor(fl, levels = fl_levels), site, survey_date,
+              value = cumulative_turnover,
+              metric = factor("Cumulative turnover", levels = metric_levels)),
+  stability_biotic_df |>
+    transmute(fl = factor(fl, levels = fl_levels), site, survey_date,
+              value = 1 - stability_from_site_centroid,
+              metric = factor("Distance from site centroid", levels = metric_levels)),
+  stability_biotic_df |>
+    transmute(fl = factor(fl, levels = fl_levels), site, survey_date,
+              value = similarity_to_baseline,
+              metric = factor("Similarity to baseline", levels = metric_levels))
+) |>
+  arrange(metric, fl, site, survey_date)
+
+unit_scale_data <- crossing(
+  metric = factor(c("Distance from site centroid", "Similarity to baseline"),
+                  levels = metric_levels),
+  fl = factor(fl_levels, levels = fl_levels),
+  value = c(0, 1)
+)
+
+# Three regionally significant disturbance events, marked on every metric
+# panel except benthic composition.
+event_dates <- tibble(
+  event_date = as.Date(c("2022-02-01", "2024-02-01", "2025-03-09")),
+  event_colour = c("wheat4", "hotpink", "purple")
+)
+
+event_plot_data <- crossing(
+  event_dates,
+  metric = factor(metric_levels[-1], levels = metric_levels),
+  fl = factor(fl_levels, levels = fl_levels)
+)
+
+# Masks the unsampled interval (July 2023-February 2025) in the composition row.
+composition_gap_data <- crossing(
+  metric = factor("Benthic composition", levels = metric_levels),
+  fl = factor(fl_levels, levels = fl_levels),
+  xmin = as.Date("2023-07-01"), xmax = as.Date("2025-02-28")
+)
+
+## 4e. Build and save the combined figure
+
+figure_2 <- ggplot() +
+  geom_area(
+    data = area_plot_data |> mutate(fl = fct_relabel(fl, trunc2)),
+    aes(x = survey_date, y = cover, fill = biotic_group, group = biotic_group),
+    position = "stack", alpha = 0.9, linewidth = 0.15, colour = "grey35", na.rm = TRUE
+  ) +
+  geom_rect(
+    data = composition_gap_data |> mutate(fl = fct_relabel(fl, trunc2)),
+    aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
+    inherit.aes = FALSE, fill = "white", alpha = 0.9
+  ) +
+  geom_ribbon(
+    data = coral_ribbon_data |> mutate(fl = fct_relabel(fl, trunc2)),
+    aes(x = survey_date, ymin = ymin, ymax = ymax, group = site),
+    inherit.aes = FALSE, fill = "#2C7FB8", alpha = 0.2, colour = NA, na.rm = TRUE
+  ) +
+  geom_line(
+    data = line_plot_data |> mutate(fl = fct_relabel(fl, trunc2)),
+    aes(x = survey_date, y = value, group = site),
+    colour = "#245A73", linewidth = 0.7, na.rm = TRUE
+  ) +
+  geom_point(
+    data = line_plot_data |> mutate(fl = fct_relabel(fl, trunc2)),
+    aes(x = survey_date, y = value, group = site),
+    colour = "#245A73", fill = "white", shape = 21, size = 1.01, stroke = 0.5, na.rm = TRUE
+  ) +
+  geom_blank(
+    data = unit_scale_data |> mutate(fl = fct_relabel(fl, trunc2)),
+    aes(y = value), inherit.aes = FALSE
+  ) +
+  geom_vline(
+    data = event_plot_data |> mutate(fl = fct_relabel(fl, trunc2)),
+    aes(xintercept = event_date, colour = event_colour),
+    linewidth = 0.8, alpha = 0.35, show.legend = FALSE
+  ) +
+  facet_grid(
+    rows = vars(metric), cols = vars(fl), scales = "free_y", switch = "y",
+    labeller = labeller(metric = as_labeller(metric_labels))
+  ) +
+  scale_fill_manual(values = biotic_palette, drop = FALSE) +
+  scale_colour_identity() +
+  scale_x_date(
+    limits = as.Date(c("2021-01-01", "2026-12-31")),
+    date_breaks = "1 year", date_labels = "%Y",
+    expand = expansion(mult = c(0.01, 0.02))
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.06))) +
+  labs(x = "Survey date", y = NULL, fill = "Benthic group") +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.spacing.x = grid::unit(0.65, "lines"),
+    panel.spacing.y = grid::unit(0.25, "lines"),
+    strip.placement = "outside",
+    strip.background.x = element_rect(fill = "grey95", colour = "grey20", linewidth = 0.9),
+    strip.text.x = element_text(face = "bold", size = 11),
+    strip.background.y = element_blank(),
+    strip.text.y.left = element_text(angle = 0, face = "plain", hjust = 1, size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    axis.title.x = element_text(size = 13),
+    legend.position = "top",
+    legend.box = "vertical",
+    legend.text = ggtext::element_markdown(size = 11),
+    legend.title = element_text(size = 12),
+    plot.margin = margin(8, 8, 8, 8),
+    panel.border = element_rect(colour = "grey20", fill = NA, linewidth = 0.9)
+  ) +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+figure_2
+
+ggsave(
+  filename = file.path(output_dir, "Figure2_five_metric_grid.png"),
+  plot = figure_2, width = 16, height = 9, dpi = 600
+)
+
+
+## 5. STATISTICS — Distance-based PERMANOVA with site x time random slopes
+# Formally tests for a directional trend in benthic composition through
+# time, independent of site identity. Uses the FULL 15-category matrix
+# (comm_cols, including substratum classes), NOT the biotic-only matrix
+# used in Figures 1-2 — this test is deliberately scoped to the whole
+# benthos. Requires the `distmer` package (see Section 0a for install).
+
+permanova_input <- biotic_df |>
+  arrange(site, survey_date) |>
+  mutate(
+    site = factor(site),
+    survey_id = paste(site, year, sprintf("%02d", month), sep = "_"),
+    time_years = as.numeric(survey_date - min(survey_date)) / 365.25
+  )
+
+stopifnot(
+  !anyDuplicated(permanova_input$survey_id),
+  !anyDuplicated(paste(permanova_input$site, permanova_input$survey_date))
+)
+
+# Full 15-category community matrix for this test.
+permanova_comm <- permanova_input |>
+  select(all_of(comm_cols)) |>
+  as.data.frame()
+rownames(permanova_comm) <- permanova_input$survey_id
+
+# No missing values expected; this check confirms that before proceeding.
+print(colSums(is.na(permanova_comm)))
+permanova_comm[is.na(permanova_comm)] <- 0
+
+permanova_matrix <- as.matrix(permanova_comm)
+if (any(!is.finite(permanova_matrix))) stop("The community matrix contains non-finite values.")
+if (any(permanova_matrix < 0)) stop("The community matrix contains negative values.")
+if (any(rowSums(permanova_matrix) == 0)) stop("At least one survey has zero total benthic cover.")
+
+permanova_bray <- vegdist(permanova_matrix, method = "bray")
+
+permanova_diagnostics <- distance_diagnostics(permanova_bray)
+
+# Model: distance ~ time_years + (1 + time_years | site)
+#   time_years                     : fixed, average linear temporal trend
+#   (1 + time_years | site)        : random site intercept + site-specific slope
+n_sites <- nlevels(permanova_input$site)
+attainable_sign_flips <- 2^n_sites   # = 256 for 8 sites
+
+time_site_fit <- permanova(
+  permanova_bray ~ time_years + (1 + time_years | site),
+  data = permanova_input,
+  permutations = "all"
+)
+
+print(time_site_fit)
+
+
+## 6. FIGURE 3 — Regional thermal stress (Degree Heating Week) history
+# Reproduces: (a) a bar chart of the domain-wide annual maximum DHW,
+# 1985-2026, and (b) spatial DHW maps for five representative years with
+# monitoring sites overlaid.
+
+## 6a. Site vector for map overlay
+
+sites_vect <- sites_coords |>
+  st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE) |>
+  vect()
+
+## 6b. Build (or load cached) per-pixel annual DHW maximum 
+# Computing the annual maximum composite from ~14,000 daily rasters is slow,
+# so it is cached to disk after the first run. If dhw_annual_max_path
+# already exists, this section loads it directly; otherwise it rebuilds it
+# from the daily GeoTIFFs in dhw_tif_dir (which must already be downloaded
+# from NOAA Coral Reef Watch).
+
+if (file.exists(dhw_annual_max_path)) {
+  
+  dhw_annual_max <- rast(dhw_annual_max_path)
+  
+} else {
+  
+  tif_files <- list.files(
+    path = path.expand(dhw_tif_dir),
+    pattern = "\\.tif(f)?$", recursive = TRUE, full.names = TRUE, ignore.case = TRUE
+  )
+  if (!length(tif_files)) stop("No GeoTIFF files found in dhw_tif_dir.")
+  
+  mb_dhw <- rast(tif_files)
+  names(mb_dhw) <- make.unique(tools::file_path_sans_ext(basename(tif_files)))
+  
+  # Per-pixel annual maximum across all daily rasters for that year.
+  dhw_annual_max <- mb_dhw |>
+    tapp(index = format(time(mb_dhw), "%Y"), fun = max, na.rm = TRUE) |>
+    setNames(paste0(unique(format(time(mb_dhw), "%Y"))))
+  
+  writeRaster(dhw_annual_max, dhw_annual_max_path, overwrite = TRUE)
+}
+
+# Domain-wide annual maximum: the single highest DHW value recorded
+# anywhere in the mapped domain in a given year (not a value specific to
+# the eight monitoring sites — see manuscript Results for this distinction).
+dhw_annual_ts <- global(dhw_annual_max, "max", na.rm = TRUE) |>
+  as_tibble(rownames = "layer") |>
+  rename(dhw_max = max) |>
+  mutate(year = as.integer(str_extract(layer, "\\d{4}")))
+
+## 6c. Select five years for spatial visualization
+
+dhw_1998 <- dhw_annual_max[["1998"]]
+dhw_2006 <- dhw_annual_max[["2006"]]
+dhw_2017 <- dhw_annual_max[["2017"]]
+dhw_2020 <- dhw_annual_max[["2020"]]
+dhw_2024 <- dhw_annual_max[["2024"]]
+
+dhw_max <- c(dhw_1998, dhw_2006, dhw_2017, dhw_2020, dhw_2024)
+names(dhw_max) <- c(1998, 2006, 2017, 2020, 2024)
+
+## 6d. Shared DHW colour scale
+
+dhw_colours <- c(
+  "#C9FBFF", "#3B3B8F", "#4F4FAF", "#6F6FC4", "#A9A9E6", "#FFFF00", "#FFE000",
+  "#FFBC00", "#FF8C00", "#FF0000", "#DD0000", "#B30000", "#7A0000", "#E3A977",
+  "#BE8050", "#94602F", "#5E3C18", "#FF00FF", "#DD00DD", "#B500B5", "#8A008A",
+  "#4E004E"
+)
+
+scale_fill_dhw <- function(...) {
+  scale_fill_stepsn(
+    colours = dhw_colours,
+    breaks  = c(0:20),      # fine (1-unit) colour bins, unchanged
+    limits  = c(0, 20),
+    oob     = scales::oob_squish,   # push values >20 into the top colour
+    name    = "DHW (\u00B0C-weeks)",
+    labels  = function(x) ifelse(x %% 4 == 0, x, ""),
+    guide   = guide_colorsteps(
+      barwidth = unit(20, "lines"),
+      barheight = unit(0.7, "lines"),
+      title.position = "top"
+    ),
+    ...
+  )
+}
+
+## 6e. Panel (a): annual bar chart
+
+panel_a <- ggplot() +
+  geom_col(
+    data = dhw_annual_ts, aes(x = year, y = dhw_max, fill = dhw_max),
+    color = "black", linewidth = 0.1
+  ) +
+  theme_bw(base_size = 15) +
+  labs(
+    x = "Year", y = "Annual maximum DHW (\u00B0C-weeks)",
+    title = "A) Annual maximum Degree Heating Weeks (domain-wide)"
+  ) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 15, hjust = 0),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  ) +
+  scale_fill_dhw() +
+  guides(fill = "none")
+
+## 6f. Panel (b): spatial maps for five years
+
+qldcoast <- rnaturalearth::ne_countries(country = "Australia", scale = "large") |>
+  st_crop(ext(dhw_2024)) |>
+  vect()
+
+site_colours <- c(
+  "Goat Island"      = "#E69F00",
+  "Green Island"     = "#56B4E9",
+  "Myora Reef"       = "#009E73",
+  "Wellington Point" = "#F0E442",
+  "Peel Island"      = "#0072B2",
+  "Flinders Reef"    = "#D55E00",
+  "Flat Rock"        = "#CC79A7",
+  "Shag Rock"        = "#000000"
+)
+
+panel_b <- ggplot() +
+  theme_bw(base_size = 15) +
+  tidyterra::geom_spatraster(data = dhw_max) +
+  facet_wrap(~lyr, nrow = 1) +
+  tidyterra::geom_spatvector(data = qldcoast, fill = "beige") +
+  tidyterra::geom_spatvector(
+    data = sites_vect, aes(colour = site),
+    fill = "white", shape = 21, size = 4, stroke = 1.6, alpha = 0.95
+  ) +
+  labs(
+    title = "B) Spatial distribution of annual maximum DHW",
+    x = "Longitude", y = "Latitude"
+  ) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 3)) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 15, hjust = 0),
+    axis.title = element_text(size = 14),
+    axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 10),
+    strip.text = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 11),
+    legend.title = element_text(size = 12)
+  ) +
+  scale_fill_dhw() +
+  scale_colour_manual(
+    values = site_colours,
+    name = "Site",
+    guide = guide_legend(position = "right", override.aes = list(size = 4, alpha = 1))
+  )
+
+## 6g. Combine and save
+
+figure_3 <- (panel_a / panel_b) +
+  plot_layout(widths = c(1, 1)) &
+  theme(legend.position = "bottom")
+
+figure_3
+
+ggsave(
+  filename = file.path(output_dir, "Figure3_regional_DHW_history.png"),
+  plot = figure_3, width = 14, height = 9, dpi = 600
+)
+
+
+## 7. SUPPLEMENTARY ANALYSES: whole-record mean composition & SIMPER
+# These produce the values reported in the "Mean site-level
+# benthic composition" and "SIMPER analysis" Results subsections.
+
+## 7a. Mean composition per site (whole-record)
+
+site_mean_composition <- biotic_df |>
+  select(site, all_of(biotic_cols)) |>
+  group_by(site) |>
+  summarise(across(everything(), \(x) mean(x, na.rm = TRUE))) |>
+  pivot_longer(-site, names_to = "taxon", values_to = "mean_cover") |>
+  filter(mean_cover > 1) |>
+  arrange(site, desc(mean_cover))
+
+print(site_mean_composition, n = Inf)
+
+write_csv(site_mean_composition, file.path(output_dir, "site_mean_composition.csv"))
+
+## 7b. SIMPER: taxa driving pairwise site dissimilarity
+
+simper_comm <- biotic_df |>
+  select(all_of(biotic_cols)) |>
+  as.data.frame()
+
+simper_fit <- simper(simper_comm, group = biotic_df$site, permutations = 999)
+simper_summary <- summary(simper_fit)
+
+# Top 3 contributing taxa per site pair, with cumulative contribution.
+simper_top3 <- map_dfr(names(simper_summary), \(pair) {
+  simper_summary[[pair]] |>
+    as_tibble(rownames = "taxon") |>
+    slice_max(average, n = 3) |>
+    mutate(pair = pair)
+}) |>
+  select(pair, taxon, average, cumsum)
+
+print(simper_top3, n = Inf)
+
+write_csv(simper_top3, file.path(output_dir, "simper_top3_by_site_pair.csv"))
+
+
+# MORETON BAY STUDY SITES MAP
+
+## 0. Packages
+
+required_packages <- c(
+  "tidyverse",    # data wrangling + ggplot2
+  "sf",           # site coordinates as spatial points
+  "terra",        # raster handling for the fetched basemap tiles
+  "tidyterra",    # geom_spatraster_rgb() to plot the basemap
+  "maptiles",     # get_tiles() - fetches Esri World Imagery tiles, no API key needed
+  "ggspatial",    # annotation_north_arrow(), annotation_scale()
+  "ggtext",       # element_markdown()/geom_richtext() for mixed bold/italic labels
+  "patchwork"     # combining the main map and the locator inset
+)
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+output_dir <- "."   # EDIT to your preferred output location
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+
+## 1a. Site coordinates
+# Same eight sites and coordinates used in the main analysis pipeline.
+
+sites_coords <- tribble(
+  ~site,              ~lon,       ~lat,
+  "Goat Island",      153.38666, -27.51592,
+  "Green Island",     153.24628, -27.42648,
+  "Myora Reef",       153.40898, -27.47254,
+  "Wellington Point", 153.24707, -27.45656,
+  "Peel Island",      153.37662, -27.49697,
+  "Flinders Reef",    153.48420, -26.97780,
+  "Flat Rock",        153.55100, -27.39130,
+  "Shag Rock",        153.52660, -27.41420
+)
+
+sites_sf <- st_as_sf(sites_coords, coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+
+## 1b. Map extent
+
+map_bbox <- st_bbox(
+  c(xmin = 152.85, ymin = -27.75, xmax = 153.70, ymax = -26.85),
+  crs = st_crs(4326)
+)
+
+bbox_xmin <- as.numeric(map_bbox["xmin"])
+bbox_xmax <- as.numeric(map_bbox["xmax"])
+bbox_ymin <- as.numeric(map_bbox["ymin"])
+bbox_ymax <- as.numeric(map_bbox["ymax"])
+
+
+## 2. Fetch satellite basemap tiles
+
+fetch_pad_deg <- 0.08   # degrees of padding beyond map_bbox on every side
+fetch_bbox <- st_bbox(
+  c(xmin = bbox_xmin - fetch_pad_deg, ymin = bbox_ymin - fetch_pad_deg,
+    xmax = bbox_xmax + fetch_pad_deg, ymax = bbox_ymax + fetch_pad_deg),
+  crs = st_crs(4326)
+)
+
+basemap_tiles <- maptiles::get_tiles(
+  x = fetch_bbox,
+  provider = "Esri.WorldImagery",
+  zoom = 11,
+  crop = TRUE
+)
+
+basemap_4326 <- terra::project(basemap_tiles, "EPSG:4326")
+
+
+## 3. Label positions
+
+site_label_pos <- tribble(
+  ~site,              ~nudge_x, ~nudge_y, ~hjust,
+  "Flinders Reef",     -0.015,   0.000,    1,
+  "Flat Rock",          0.015,   0.010,    0,
+  "Shag Rock",          0.015,  -0.010,    0,
+  "Green Island",       0.015,   0.010,    0,
+  "Wellington Point",   0.015,  -0.010,    0,
+  "Myora Reef",          0.015,   0.010,    0,
+  "Peel Island",        -0.015,   0.000,    1,
+  "Goat Island",         0.015,  -0.010,    0
+) |>
+  left_join(sites_coords, by = "site") |>
+  mutate(label_x = lon + nudge_x, label_y = lat + nudge_y)
+
+bay_label <- tribble(
+  ~lon,      ~lat,      ~label,
+  153.26,   -27.30,    "**MORETON BAY**<br>*(Quandamooka Sea Country)*"
+)
+
+island_labels <- tribble(
+  ~lon,      ~lat,      ~label,
+  153.51,   -27.1,    "**MORETON ISLAND**<br>*(Mulgumpin)*",
+  153.59,   -27.5,    "**NORTH STRADBROKE<br>ISLAND**<br>*(Minjerribah)*"
+)
+
+river_labels <- tribble(
+  ~lon,      ~lat,      ~label,      ~angle,
+  153.10,   -27.42,    "Brisbane River",  20
+)
+
+
+## 3c. Latitude/longitude axis breaks
+lon_breaks <- seq(ceiling(bbox_xmin / 0.2) * 0.2, floor(bbox_xmax / 0.2) * 0.2, by = 0.2)
+lat_breaks <- seq(ceiling(bbox_ymin / 0.2) * 0.2, floor(bbox_ymax / 0.2) * 0.2, by = 0.2)
+
+lon_label_fun <- function(x) paste0(sprintf("%.1f", x), "\u00B0E")
+lat_label_fun <- function(x) paste0(sprintf("%.1f", abs(x)), "\u00B0S")
+
+
+## 4. Build the main map
+
+main_map <- ggplot() +
+  tidyterra::geom_spatraster_rgb(data = basemap_4326, maxcell = 5e6) +
+  geom_segment(
+    data = site_label_pos,
+    aes(x = lon, y = lat, xend = label_x, yend = label_y),
+    colour = "white", linewidth = 0.4, alpha = 0.8
+  ) +
+  geom_point(
+    data = sites_sf, aes(geometry = geometry),
+    stat = "sf_coordinates", shape = 21, size = 3,
+    fill = "white", colour = "black", stroke = 0.8
+  ) +
+  geom_text(
+    data = site_label_pos,
+    aes(x = label_x, y = label_y, label = site, hjust = hjust),
+    colour = "white", size = 4.2, fontface = "bold"
+  ) +
+  geom_text(
+    data = river_labels,
+    aes(x = lon, y = lat, label = label, angle = angle),
+    colour = "white", size = 4.2, fontface = "bold"
+  ) +
+  ggtext::geom_richtext(
+    data = bay_label,
+    aes(x = lon, y = lat, label = label),
+    colour = "white", size = 4.2, fill = NA, label.color = NA,
+    hjust = 0.5
+  ) +
+  ggtext::geom_richtext(
+    data = island_labels,
+    aes(x = lon, y = lat, label = label),
+    colour = "white", size = 4.2, fill = NA, label.color = NA,
+    hjust = 0.5
+  ) +
+  annotate(
+    "text",
+    x = bbox_xmax - 0.01, y = bbox_ymin + 0.015,
+    label = "Esri, Maxar, Earthstar Geographics",
+    colour = "white", size = 2.6, hjust = 1, vjust = 0
+  ) +
+  scale_x_continuous(breaks = lon_breaks, labels = lon_label_fun) +
+  scale_y_continuous(breaks = lat_breaks, labels = lat_label_fun) +
+  coord_sf(
+    xlim = c(bbox_xmin, bbox_xmax),
+    ylim = c(bbox_ymin, bbox_ymax),
+    crs = st_crs(4326),
+    expand = FALSE
+  ) +
+  ggspatial::annotation_north_arrow(
+    location = "tr", which_north = "true",
+    style = ggspatial::north_arrow_fancy_orienteering(
+      text_col = "white", line_col = "white", fill = c("white", "white")
+    ),
+    height = unit(1.2, "cm"), width = unit(1.2, "cm")
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(fill = NA, colour = "black", linewidth = 0.8),
+    axis.title = element_blank(),
+    axis.text = element_text(colour = "black", size = 10),
+    axis.ticks = element_line(colour = "black"),
+    axis.ticks.length = unit(0.15, "cm"),
+    plot.margin = margin(4, 4, 4, 4)
+  )
+
+
+## 5. Australia-wide locator inset
+
+australia_bbox <- st_bbox(
+  c(xmin = 112, ymin = -44, xmax = 154, ymax = -10),
+  crs = st_crs(4326)
+)
+
+australia_tiles <- maptiles::get_tiles(
+  x = australia_bbox,
+  provider = "Esri.WorldImagery",
+  zoom = 5,
+  crop = TRUE
+)
+
+australia_4326 <- terra::project(australia_tiles, "EPSG:4326")
+
+locator_inset <- ggplot() +
+  tidyterra::geom_spatraster_rgb(data = australia_4326, maxcell = 2e6) +
+  annotate(
+    "rect",
+    xmin = bbox_xmin, xmax = bbox_xmax,
+    ymin = bbox_ymin, ymax = bbox_ymax,
+    colour = "red", fill = NA, linewidth = 2
+  ) +
+  coord_sf(
+    xlim = c(australia_bbox["xmin"], australia_bbox["xmax"]),
+    ylim = c(australia_bbox["ymin"], australia_bbox["ymax"]),
+    expand = FALSE
+  ) +
+  theme_void() +
+  theme(
+    panel.border = element_rect(fill = NA, colour = "black", linewidth = 0.6)
+  )
+
+## ---- 6. Combine main map and inset, then save -------------------------------
+
+figure_site_map <- main_map +
+  inset_element(
+    locator_inset,
+    left = 0.02, bottom = 0.72, right = 0.28, top = 0.98
+  )
+
+figure_site_map
+
+fig_width_in <- 9
+map_aspect_ratio <- ((bbox_xmax - bbox_xmin) * cos(mean(c(bbox_ymin, bbox_ymax)) * pi / 180)) /
+  (bbox_ymax - bbox_ymin)
+fig_height_in <- fig_width_in / map_aspect_ratio
+
+ggsave(
+  filename = file.path(output_dir, "Figure_site_map.png"),
+  plot = figure_site_map, width = fig_width_in, height = fig_height_in, dpi = 300
+)
+
+## END OF SCRIPT
